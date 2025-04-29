@@ -29,101 +29,533 @@ References:
 Replace code below according to your needs.
 """
 
-from typing import TYPE_CHECKING
-
-from magicgui import magic_factory
-from magicgui.widgets import CheckBox, Container, create_widget
-from qtpy.QtWidgets import QHBoxLayout, QPushButton, QWidget
-from skimage.util import img_as_float
-
-if TYPE_CHECKING:
-    import napari
-
-
-# Uses the `autogenerate: true` flag in the plugin manifest
-# to indicate it should be wrapped as a magicgui to autogenerate
-# a widget.
-def threshold_autogenerate_widget(
-    img: "napari.types.ImageData",
-    threshold: "float",
-) -> "napari.types.LabelsData":
-    return img_as_float(img) > threshold
-
-
-# the magic_factory decorator lets us customize aspects of our widget
-# we specify a widget type for the threshold parameter
-# and use auto_call=True so the function is called whenever
-# the value of a parameter changes
-@magic_factory(
-    threshold={"widget_type": "FloatSlider", "max": 1}, auto_call=True
+import napari
+import napari.layers
+import numpy as np
+from magicgui.widgets import Button, CheckBox, create_widget
+from qtpy.QtWidgets import (
+    QGridLayout,
+    QGroupBox,
+    QLabel,
+    QPushButton,
+    QScrollArea,
+    QSizePolicy,
+    QVBoxLayout,
+    QWidget,
 )
-def threshold_magic_widget(
-    img_layer: "napari.layers.Image", threshold: "float"
-) -> "napari.types.LabelsData":
-    return img_as_float(img_layer.data) > threshold
+
+from ._utils import (
+    bin_median,
+    generate_multiple_cuboids_simple,
+    generate_single_cuboid,
+    local_threshold,
+    local_threshold_simple,
+    merge_labels,
+    pipette_mask_auto,
+    pipette_mask_manual,
+    split_labels,
+    watershed_auto_fix,
+)
 
 
-# if we want even more control over our widget, we can use
-# magicgui `Container`
-class ImageThreshold(Container):
-    def __init__(self, viewer: "napari.viewer.Viewer"):
-        super().__init__()
-        self._viewer = viewer
-        # use create_widget to generate widgets from type annotations
-        self._image_layer_combo = create_widget(
-            label="Image", annotation="napari.layers.Image"
+class BinGB(QGroupBox):
+    def __init__(
+        self,
+        viewer,
+        name,
+    ):
+
+        super().__init__(name)
+        self.viewer = viewer
+        self.layout = QGridLayout()
+        self.setLayout(self.layout)
+
+        self.input_img_combo = create_widget(annotation=napari.layers.Image)
+        self.bin_size_spinbox = create_widget(
+            annotation=int, options={"min": 2, "max": 5, "value": 2}
         )
-        self._threshold_slider = create_widget(
-            label="Threshold", annotation=float, widget_type="FloatSlider"
+        self.run_button = Button(label="Run")
+
+        self.viewer.layers.events.inserted.connect(
+            self.input_img_combo.reset_choices
         )
-        self._threshold_slider.min = 0
-        self._threshold_slider.max = 1
-        # use magicgui widgets directly
-        self._invert_checkbox = CheckBox(text="Keep pixels below threshold")
-
-        # connect your own callbacks
-        self._threshold_slider.changed.connect(self._threshold_im)
-        self._invert_checkbox.changed.connect(self._threshold_im)
-
-        # append into/extend the container with your widgets
-        self.extend(
-            [
-                self._image_layer_combo,
-                self._threshold_slider,
-                self._invert_checkbox,
-            ]
+        self.viewer.layers.events.removed.connect(
+            self.input_img_combo.reset_choices
         )
 
-    def _threshold_im(self):
-        image_layer = self._image_layer_combo.value
-        if image_layer is None:
+        self.layout.addWidget(QLabel("Input"), 0, 0)
+        self.layout.addWidget(self.input_img_combo.native, 0, 1, 1, 2)
+        self.layout.addWidget(QLabel("Bin kernel"), 1, 0)
+        self.layout.addWidget(self.bin_size_spinbox.native, 1, 1, 1, 2)
+        self.layout.addWidget(self.run_button.native, 2, 0, 1, 3)
+
+        self.run_button.clicked.connect(self._run_bin)
+
+    def _run_bin(self):
+        img_layer = self.input_img_combo.value
+        img = img_layer.data
+        kernel_size = self.bin_size_spinbox.value
+
+        binned = bin_median(img=img, kernel_size=kernel_size)
+        self.viewer.add_image(binned, name="Binned")
+
+
+class PipetteGB(QGroupBox):
+    def __init__(
+        self,
+        viewer,
+        name,
+    ):
+
+        super().__init__(name)
+        self.viewer = viewer
+        self.layout = QGridLayout()
+        self.setLayout(self.layout)
+
+        self.input_img_combo = create_widget(annotation=napari.layers.Image)
+        self.input_points_combo = create_widget(
+            annotation=napari.layers.Points
+        )
+
+        self.auto_button = QPushButton("Auto")
+        self.auto_button.setCheckable(True)
+        self.auto_button.setChecked(True)
+
+        self.sigma_spinbox = create_widget(
+            annotation=int, options={"min": 1, "max": 5, "value": 2}
+        )
+        self.low_thresh_spinbox = create_widget(
+            annotation=int, options={"min": 0, "max": 20, "value": 5}
+        )
+        self.high_thresh_spinbox = create_widget(
+            annotation=int, options={"min": 0, "max": 20, "value": 8}
+        )
+        self.win_size_spinbox = create_widget(
+            annotation=int, options={"min": 0, "max": 20, "value": 7}
+        )
+        self.plot_cb = CheckBox(text="Plot", value=True)
+
+        self.run_button = Button(label="Run")
+
+        self.viewer.layers.events.inserted.connect(
+            self.input_img_combo.reset_choices
+        )
+        self.viewer.layers.events.removed.connect(
+            self.input_img_combo.reset_choices
+        )
+        self.viewer.layers.events.inserted.connect(
+            self.input_points_combo.reset_choices
+        )
+        self.viewer.layers.events.removed.connect(
+            self.input_points_combo.reset_choices
+        )
+
+        self.layout.addWidget(QLabel("Input"), 0, 0)
+        self.layout.addWidget(self.input_img_combo.native, 0, 1)
+        self.layout.addWidget(self.auto_button, 0, 2)
+
+        self.layout.addWidget(QLabel("Points"), 1, 0)
+        self.layout.addWidget(self.input_points_combo.native, 1, 1, 1, 2)
+
+        self.layout.addWidget(QLabel("Sigma"), 2, 0)
+        self.layout.addWidget(self.sigma_spinbox.native, 2, 1, 1, 2)
+        self.layout.addWidget(QLabel("Low thr."), 3, 0)
+        self.layout.addWidget(self.low_thresh_spinbox.native, 3, 1, 1, 2)
+        self.layout.addWidget(QLabel("High thr."), 4, 0)
+        self.layout.addWidget(self.high_thresh_spinbox.native, 4, 1, 1, 2)
+        self.layout.addWidget(QLabel("Win. size"), 5, 0)
+        self.layout.addWidget(self.win_size_spinbox.native, 5, 1, 1, 2)
+
+        self.layout.addWidget(self.plot_cb.native, 6, 0)
+
+        self.layout.addWidget(self.run_button.native, 7, 0, 1, 3)
+
+        self.run_button.clicked.connect(self._run_pipette_detect)
+
+    def _run_pipette_detect(self):
+        img_layer = self.input_img_combo.value
+        img = img_layer.data
+        auto = self.auto_button.isChecked()
+        if not auto:
+            points_layer = self.input_points_combo.value
+            points = points_layer.data
+        sigma = self.sigma_spinbox.value
+        low = self.low_thresh_spinbox.value
+        high = self.high_thresh_spinbox.value
+        win = self.win_size_spinbox.value
+        plot = self.plot_cb.value
+
+        if auto:
+            mask = pipette_mask_auto(img, sigma, (low, high), win, plot)
+        else:
+            mask = pipette_mask_manual(img, points)
+
+        self.viewer.add_labels(mask, name="Pipette mask")
+
+
+class ThresholdGB(QGroupBox):
+    def __init__(
+        self,
+        viewer,
+        name,
+    ):
+
+        super().__init__(name)
+        self.viewer = viewer
+        self.layout = QGridLayout()
+        self.setLayout(self.layout)
+
+        self.input_img_combo = create_widget(annotation=napari.layers.Image)
+        self.mask_combo = create_widget(annotation=napari.layers.Labels)
+
+        self.local_button = QPushButton("Local")
+        self.local_button.setCheckable(True)
+        self.local_button.setChecked(True)
+
+        self.spacing_spinbox = create_widget(
+            annotation=int, options={"min": 3, "value": 52}
+        )
+        self.win_size_spinbox = create_widget(
+            annotation=float,
+            options={"min": 0.1, "max": 2, "value": 1, "step": 0.1},
+        )
+        self.num_components_spinbox = create_widget(
+            annotation=int, options={"min": 2, "max": 5, "value": 2}
+        )
+        self.min_std_spinbox = create_widget(
+            annotation=float, options={"value": 4000}
+        )
+        self.num_processes_spinbox = create_widget(
+            annotation=int, options={"min": 1, "value": 4}
+        )
+
+        self.plot_thresh_cb = CheckBox(value=False, text="Plot thresh.")
+        self.run_button = Button(label="Run")
+
+        self.viewer.layers.events.inserted.connect(
+            self.input_img_combo.reset_choices
+        )
+        self.viewer.layers.events.removed.connect(
+            self.input_img_combo.reset_choices
+        )
+        self.viewer.layers.events.inserted.connect(
+            self.mask_combo.reset_choices
+        )
+        self.viewer.layers.events.removed.connect(
+            self.mask_combo.reset_choices
+        )
+
+        self.layout.addWidget(QLabel("Input"), 0, 0)
+        self.layout.addWidget(self.local_button, 0, 2)
+        self.layout.addWidget(self.input_img_combo.native, 0, 1)
+
+        self.layout.addWidget(QLabel("Mask"), 1, 0)
+        self.layout.addWidget(self.mask_combo.native, 1, 1, 1, 2)
+
+        self.layout.addWidget(QLabel("Spacing"), 2, 0)
+        self.layout.addWidget(self.spacing_spinbox.native, 2, 1, 1, 2)
+        self.layout.addWidget(QLabel("Win. size"), 3, 0)
+        self.layout.addWidget(self.win_size_spinbox.native, 3, 1, 1, 2)
+        self.layout.addWidget(QLabel("Components"), 4, 0)
+        self.layout.addWidget(self.num_components_spinbox.native, 4, 1, 1, 2)
+        self.layout.addWidget(QLabel("Min. std"), 5, 0)
+        self.layout.addWidget(self.min_std_spinbox.native, 5, 1, 1, 2)
+        self.layout.addWidget(QLabel("Processes"), 6, 0)
+        self.layout.addWidget(self.num_processes_spinbox.native, 6, 1, 1, 2)
+
+        self.layout.addWidget(self.plot_thresh_cb.native, 7, 0)
+        self.layout.addWidget(self.run_button.native, 7, 1, 1, 2)
+
+        self.run_button.clicked.connect(self._run_threshold)
+
+    def _run_threshold(self):
+        img_layer = self.input_img_combo.value
+        img = img_layer.data
+        local = self.local_button.isChecked()
+
+        mask_layer = self.mask_combo.value
+        mask = mask_layer.data
+
+        spacing = self.spacing_spinbox.value
+        win_size = self.win_size_spinbox.value
+        n_comp = self.num_components_spinbox.value
+        min_std = self.min_std_spinbox.value
+        processes = self.num_processes_spinbox.value
+        plot = self.plot_thresh_cb.value
+
+        if local:
+            if processes == 1:
+                binary, thresh_map = local_threshold_simple(
+                    img, mask, spacing, win_size, n_comp, min_std
+                )
+            else:
+                binary, thresh_map = local_threshold(
+                    img, mask, spacing, win_size, n_comp, min_std, processes
+                )
+            if plot:
+                contrast = [np.min(thresh_map[mask]), np.max[thresh_map[mask]]]
+                self.viewer.add_image(
+                    thresh_map,
+                    colormap="inferno",
+                    name="Threshold map",
+                    visibility=False,
+                    contrast_limits=contrast,
+                )
+            self.viewer.add_labels(binary, name="Binary")
+
+
+class LabelGB(QGroupBox):
+    def __init__(
+        self,
+        viewer,
+        name,
+    ):
+
+        super().__init__(name)
+        self.viewer = viewer
+        self.layout = QGridLayout()
+        self.setLayout(self.layout)
+
+        self.input_binary_combo = create_widget(
+            annotation=napari.layers.Labels
+        )
+
+        self.watershed_lvl_spinbox = create_widget(
+            annotation=int, options={"min": 1, "value": 3}
+        )
+        self.overseg_thresh_spinbox = create_widget(
+            annotation=float,
+            options={"min": 0, "max": 1, "value": 0.3, "step": 0.1},
+        )
+        self.plot_interm_cb = CheckBox(value=False, text="Plot interm.")
+        self.run_button = Button(label="Run")
+
+        self.labels_img_combo = create_widget(annotation=napari.layers.Labels)
+        self.manual_input = create_widget(annotation=str, value="1,2,3")
+        self.merge_button = Button(label="Merge")
+        self.split_button = Button(label="Split")
+
+        self.viewer.layers.events.inserted.connect(
+            self.input_binary_combo.reset_choices
+        )
+        self.viewer.layers.events.removed.connect(
+            self.input_binary_combo.reset_choices
+        )
+        self.viewer.layers.events.inserted.connect(
+            self.labels_img_combo.reset_choices
+        )
+        self.viewer.layers.events.removed.connect(
+            self.labels_img_combo.reset_choices
+        )
+
+        self.layout.addWidget(QLabel("Input"), 0, 0)
+        self.layout.addWidget(self.input_binary_combo.native, 0, 1)
+        self.layout.addWidget(
+            QLabel("Watershed lvl"),
+            1,
+            0,
+        )
+        self.layout.addWidget(self.watershed_lvl_spinbox.native, 1, 1)
+        self.layout.addWidget(QLabel("Merge thr."), 2, 0)
+        self.layout.addWidget(self.overseg_thresh_spinbox.native, 2, 1)
+        self.layout.addWidget(self.plot_interm_cb.native, 3, 0)
+        self.layout.addWidget(self.run_button.native, 3, 1)
+
+        self.layout.addWidget(QLabel("Fix manually (opt.):"), 4, 0, 1, 2)
+        self.layout.addWidget(QLabel("Labels layer"), 5, 0)
+        self.layout.addWidget(self.labels_img_combo.native, 5, 1)
+        self.layout.addWidget(QLabel("Target labels"), 6, 0)
+        self.layout.addWidget(self.manual_input.native, 6, 1)
+        self.layout.addWidget(self.merge_button.native, 7, 0)
+        self.layout.addWidget(self.split_button.native, 7, 1)
+
+        self.run_button.clicked.connect(self._run_labelling)
+        self.merge_button.clicked.connect(self._run_manual_merge)
+        self.split_button.clicked.connect(self._run_manual_split)
+
+    def _run_labelling(self):
+        binary_layer = self.input_binary_combo.value
+        binary = binary_layer.data
+
+        if np.any((binary != 0) & (binary != 1)):
+            print("Selected layer is not binary")
             return
 
-        image = img_as_float(image_layer.data)
-        name = image_layer.name + "_thresholded"
-        threshold = self._threshold_slider.value
-        if self._invert_checkbox.value:
-            thresholded = image < threshold
-        else:
-            thresholded = image > threshold
-        if name in self._viewer.layers:
-            self._viewer.layers[name].data = thresholded
-        else:
-            self._viewer.add_labels(thresholded, name=name)
+        watershed_lvl = self.watershed_lvl_spinbox.value
+        overseg_threshold = self.overseg_thresh_spinbox.value
+
+        image_iterations = watershed_auto_fix(
+            binary=binary.astype(bool),
+            watershed_lvl=watershed_lvl,
+            overseg_threshold=overseg_threshold,
+        )
+
+        if self.plot_interm_cb.value and len(image_iterations) >= 2:
+            for i in range(len(image_iterations) - 1):
+                self.viewer.add_labels(
+                    image_iterations[i],
+                    name=f"Interm. labels {i}",
+                    visible=False,
+                )
+
+        self.viewer.add_labels(image_iterations[-1], name="Labels")
+
+    def _run_manual_merge(self):
+        labels_layer = self.labels_img_combo.value
+        labels = labels_layer.data
+
+        target_str = self.manual_input.value
+        targets = [int(x.strip()) for x in target_str.split(",") if x.strip()]
+
+        merged = merge_labels(labels, targets)
+
+        self.viewer.add_labels(merged, name="Merged labels")
+
+    def _run_manual_split(self):
+        binary_layer = self.input_binary_combo.value
+        binary = binary_layer.data
+
+        labels_layer = self.labels_img_combo.value
+        labels = labels_layer.data
+
+        target_str = self.manual_input.value
+        targets = [int(x.strip()) for x in target_str.split(",") if x.strip()]
+
+        watershed_lvl = self.watershed_lvl_spinbox.value
+
+        split = split_labels(labels, binary, targets, watershed_lvl)
+
+        self.viewer.add_labels(split, name="Split labels")
 
 
-class ExampleQWidget(QWidget):
-    # your QWidget.__init__ can optionally request the napari viewer instance
-    # use a type annotation of 'napari.viewer.Viewer' for any parameter
-    def __init__(self, viewer: "napari.viewer.Viewer"):
-        super().__init__()
+class MeshGB(QGroupBox):
+    def __init__(
+        self,
+        viewer,
+        name,
+    ):
+
+        super().__init__(name)
         self.viewer = viewer
+        self.layout = QGridLayout()
+        self.setLayout(self.layout)
 
-        btn = QPushButton("Click me!")
-        btn.clicked.connect(self._on_click)
+        self.labels_img_combo = create_widget(annotation=napari.layers.Labels)
+        self.dirpath_str = create_widget(annotation=str, value="CuboidData")
+        self.smooth_spinbox = create_widget(
+            annotation=int, options={"min": 0, "value": 20}
+        )
+        self.voxel_spinbox = create_widget(
+            annotation=float, options={"value": 600}
+        )
+        self.sample_cb = CheckBox(value=True, text="Single label:")
+        self.sample_spinbox = create_widget(
+            annotation=int, options={"min": 1, "value": 1}
+        )
+        self.gen_button = Button(label="Generate")
 
-        self.setLayout(QHBoxLayout())
-        self.layout().addWidget(btn)
+        self.viewer.layers.events.inserted.connect(
+            self.labels_img_combo.reset_choices
+        )
+        self.viewer.layers.events.removed.connect(
+            self.labels_img_combo.reset_choices
+        )
 
-    def _on_click(self):
-        print("napari has", len(self.viewer.layers), "layers")
+        self.layout.addWidget(QLabel("Input"), 0, 0)
+        self.layout.addWidget(self.labels_img_combo.native, 0, 1, 1, 2)
+        self.layout.addWidget(
+            QLabel("Directory"),
+            1,
+            0,
+        )
+        self.layout.addWidget(self.dirpath_str.native, 1, 1, 1, 2)
+        self.layout.addWidget(QLabel("Voxel size [\u03bcm]"), 2, 0, 1, 2)
+        self.layout.addWidget(self.voxel_spinbox.native, 2, 2)
+        self.layout.addWidget(QLabel("Smooting iterations"), 3, 0, 1, 2)
+        self.layout.addWidget(self.smooth_spinbox.native, 3, 2)
+        self.layout.addWidget(self.sample_cb.native, 4, 0, 1, 2)
+        self.layout.addWidget(self.sample_spinbox.native, 4, 2)
+        self.layout.addWidget(self.gen_button.native, 5, 0, 1, 3)
+
+        self.gen_button.clicked.connect(self._run_generation)
+
+    def _run_generation(self):
+        labels_layer = self.labels_img_combo.value
+        labels = labels_layer.data
+
+        dirpath_str = self.dirpath_str.value
+
+        vsize = self.voxel_spinbox.value
+        smooth_iter = self.smooth_spinbox.value
+
+        single = self.sample_cb.value
+
+        if single:
+            label = self.sample_spinbox.value
+            vertices, faces, metrics = generate_single_cuboid(
+                labels, label, vsize, smooth_iter
+            )
+
+            for layer in self.viewer.layers:
+                layer.visible = False
+
+            self.viewer.dims.ndisplay = 3
+
+            self.viewer.add_surface((vertices, faces), name=f"Cuboid{label}")
+
+            self.viewer.camera.center = tuple(vertices.mean(axis=0))
+
+            print(f"Cuboid{label}")
+            print(
+                f"volume:{metrics[0]:.2e}   compactness: {metrics[1]:.3f}   convexity: {metrics[2]:.3f}"
+            )
+            print(f"IoU: {metrics[3]:.3f}   inertia ratio:{metrics[4]:.3f}")
+
+        else:
+            generate_multiple_cuboids_simple(
+                labels, vsize, smooth_iter, dir_path=dirpath_str
+            )
+
+
+class TissueCuboidAnalysisQWidget(QWidget):
+    def __init__(self, napari_viewer):
+        super().__init__()
+        self.viewer = napari_viewer
+
+        self.bin_groupbox = BinGB(viewer=self.viewer, name="1:Median binning")
+        self.pipette_groupbox = PipetteGB(
+            viewer=self.viewer, name="2: Pipette mask extraction"
+        )
+        self.threshold_groupbox = ThresholdGB(
+            viewer=self.viewer, name="3. GMM thresholding"
+        )
+        self.label_groupbox = LabelGB(viewer=self.viewer, name="3: Labelling")
+        self.mesh_groupbox = MeshGB(
+            viewer=self.viewer, name="4: Mesh and metrics generation"
+        )
+
+        # Set plugin layout
+        self.layout = QVBoxLayout()
+        self.setLayout(self.layout)
+
+        # Make plugin scrollable
+        self.scroll = QScrollArea(self)
+        self.layout.addWidget(self.scroll)
+        self.scroll.setWidgetResizable(True)
+        self.scroll_content = QWidget(self.scroll)
+        self.scroll_layout = QVBoxLayout(self.scroll_content)
+        self.scroll_content.setLayout(self.scroll_layout)
+        self.scroll_content.setSizePolicy(
+            QSizePolicy.Preferred, QSizePolicy.Maximum
+        )
+
+        # Add individual widgets to plugin
+        self.scroll_layout.addWidget(self.bin_groupbox)
+        self.scroll_layout.addWidget(self.pipette_groupbox)
+        self.scroll_layout.addWidget(self.threshold_groupbox)
+        self.scroll_layout.addWidget(self.label_groupbox)
+        self.scroll_layout.addWidget(self.mesh_groupbox)
+
+        self.scroll.setWidget(self.scroll_content)
+
+        self.parameters = {}
