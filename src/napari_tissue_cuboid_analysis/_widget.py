@@ -45,11 +45,14 @@ from qtpy.QtWidgets import (
 )
 
 from ._utils import (
+    apply_threshold,
+    bin_closing,
     bin_median,
+    bin_opening,
     generate_multiple_cuboids_simple,
     generate_single_cuboid,
-    local_threshold,
-    local_threshold_simple,
+    global_threshold_multi_otsu,
+    local_threshold_multi_otsu,
     merge_labels,
     pipette_mask_auto,
     pipette_mask_manual,
@@ -219,15 +222,6 @@ class ThresholdGB(QGroupBox):
             annotation=float,
             options={"min": 0.1, "max": 2, "value": 1, "step": 0.1},
         )
-        self.num_components_spinbox = create_widget(
-            annotation=int, options={"min": 2, "max": 5, "value": 2}
-        )
-        self.min_std_spinbox = create_widget(
-            annotation=float, options={"value": 4000}
-        )
-        self.num_processes_spinbox = create_widget(
-            annotation=int, options={"min": 1, "value": 4}
-        )
 
         self.plot_thresh_cb = CheckBox(value=False, text="Plot thresh.")
         self.run_button = Button(label="Run")
@@ -256,15 +250,9 @@ class ThresholdGB(QGroupBox):
         self.layout.addWidget(self.spacing_spinbox.native, 2, 1, 1, 2)
         self.layout.addWidget(QLabel("Win. size"), 3, 0)
         self.layout.addWidget(self.win_size_spinbox.native, 3, 1, 1, 2)
-        self.layout.addWidget(QLabel("Components"), 4, 0)
-        self.layout.addWidget(self.num_components_spinbox.native, 4, 1, 1, 2)
-        self.layout.addWidget(QLabel("Min. std"), 5, 0)
-        self.layout.addWidget(self.min_std_spinbox.native, 5, 1, 1, 2)
-        self.layout.addWidget(QLabel("Processes"), 6, 0)
-        self.layout.addWidget(self.num_processes_spinbox.native, 6, 1, 1, 2)
 
-        self.layout.addWidget(self.plot_thresh_cb.native, 7, 0)
-        self.layout.addWidget(self.run_button.native, 7, 1, 1, 2)
+        self.layout.addWidget(self.plot_thresh_cb.native, 4, 0)
+        self.layout.addWidget(self.run_button.native, 4, 1, 1, 2)
 
         self.run_button.clicked.connect(self._run_threshold)
 
@@ -278,20 +266,13 @@ class ThresholdGB(QGroupBox):
 
         spacing = self.spacing_spinbox.value
         win_size = self.win_size_spinbox.value
-        n_comp = self.num_components_spinbox.value
-        min_std = self.min_std_spinbox.value
-        processes = self.num_processes_spinbox.value
         plot = self.plot_thresh_cb.value
 
         if local:
-            if processes == 1:
-                binary, thresh_map = local_threshold_simple(
-                    img, mask, spacing, win_size, n_comp, min_std
-                )
-            else:
-                binary, thresh_map = local_threshold(
-                    img, mask, spacing, win_size, n_comp, min_std, processes
-                )
+            thresh_map = local_threshold_multi_otsu(
+                img, mask, spacing, win_size
+            )
+            binary = apply_threshold(img, thresh_map, mask)
             if plot:
                 contrast = [np.min(thresh_map[mask]), np.max[thresh_map[mask]]]
                 self.viewer.add_image(
@@ -301,7 +282,70 @@ class ThresholdGB(QGroupBox):
                     visibility=False,
                     contrast_limits=contrast,
                 )
-            self.viewer.add_labels(binary, name="Binary")
+        else:
+            binary = global_threshold_multi_otsu(img, mask)
+
+        self.viewer.add_labels(binary, name="Binary")
+
+
+class MorphologyGB(QGroupBox):
+    def __init__(
+        self,
+        viewer,
+        name,
+    ):
+
+        super().__init__(name)
+        self.viewer = viewer
+        self.layout = QGridLayout()
+        self.setLayout(self.layout)
+
+        self.input_binary_combo = create_widget(annotation=napari.layers.Image)
+
+        self.d_spinbox = create_widget(
+            annotation=int, options={"min": 3, "value": 3, "step": 2}
+        )
+        self.open_button = Button(label="Open")
+        self.close_button = Button(label="Close")
+
+        self.viewer.layers.events.inserted.connect(
+            self.input_binary_combo.reset_choices
+        )
+        self.viewer.layers.events.removed.connect(
+            self.input_binary_combo.reset_choices
+        )
+
+        self.layout.addWidget(QLabel("Input"), 0, 0)
+        self.layout.addWidget(self.input_binary_combo.native, 0, 1)
+
+        self.layout.addWidget(QLabel("Diameter"), 2, 0)
+        self.layout.addWidget(self.d_spinbox.native, 2, 1)
+
+        self.layout.addWidget(self.open_button.native, 3, 0)
+        self.layout.addWidget(self.close_button.native, 3, 1)
+
+        self.open_button.clicked.connect(self._run_opening)
+        self.close_button.clicked.connect(self._run_closing)
+
+    def _run_opening(self):
+        binary_layer = self.input_binary_combo.value
+        binary = binary_layer.data
+
+        diameter = self.d_spinbox.value
+
+        opened = bin_opening(binary, diameter)
+
+        self.viewer.add_labels(opened, name="BinaryFiltered")
+
+    def _run_closing(self):
+        binary_layer = self.input_binary_combo.value
+        binary = binary_layer.data
+
+        diameter = self.d_spinbox.value
+
+        closed = bin_closing(binary, diameter)
+
+        self.viewer.add_labels(closed, name="BinaryFiltered")
 
 
 class LabelGB(QGroupBox):
@@ -527,11 +571,14 @@ class TissueCuboidAnalysisQWidget(QWidget):
             viewer=self.viewer, name="2: Pipette mask extraction"
         )
         self.threshold_groupbox = ThresholdGB(
-            viewer=self.viewer, name="3. GMM thresholding"
+            viewer=self.viewer, name="3. Thresholding"
         )
-        self.label_groupbox = LabelGB(viewer=self.viewer, name="3: Labelling")
+        self.morphology_groupbox = MorphologyGB(
+            viewer=self.viewer, name="4: Morphology"
+        )
+        self.label_groupbox = LabelGB(viewer=self.viewer, name="5: Labelling")
         self.mesh_groupbox = MeshGB(
-            viewer=self.viewer, name="4: Mesh and metrics generation"
+            viewer=self.viewer, name="6: Mesh and metrics generation"
         )
 
         # Set plugin layout
@@ -553,6 +600,7 @@ class TissueCuboidAnalysisQWidget(QWidget):
         self.scroll_layout.addWidget(self.bin_groupbox)
         self.scroll_layout.addWidget(self.pipette_groupbox)
         self.scroll_layout.addWidget(self.threshold_groupbox)
+        self.scroll_layout.addWidget(self.morphology_groupbox)
         self.scroll_layout.addWidget(self.label_groupbox)
         self.scroll_layout.addWidget(self.mesh_groupbox)
 

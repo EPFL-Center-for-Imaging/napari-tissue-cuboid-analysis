@@ -29,18 +29,52 @@ You can install `napari-tissue-cuboid-analysis` via [pip]:
 
     pip install napari-tissue-cuboid-analysis
 
-
-
-
-## Contributing
-
-Contributions are very welcome. Tests can be run with [tox], please ensure
-the coverage at least stays the same before you submit a pull request.
-
 ## License
 
 Distributed under the terms of the [BSD-3] license,
 "napari-tissue-cuboid-analysis" is free and open source software
+
+## Usage
+Open the plugin automatically when launching [napari]:
+
+    napari --with napari-tissue-cuboid-analysis
+
+### 1: Median binning
+Reduces the size of the image by applying an isotropic median kernel. This step is not mandatory and only helps accelerating the rest of the pipeline and removing some noise in the image.
+
+- **Input type:**     Graylevel image
+- **Bin kernel**      Size of the median kernel
+
+### 2: Pipette extraction
+Extracts a binary mask of the pipette that will be used to discard useless areas in further steps. Can either be computed automatically or manually. Default method is automatic.
+
+**Automatic:** Requires tuning of the parameters of a canny edge detector and the window size parameter. If tuned correctly, the pipette is detected automatically. The automatic detection is rather sensitive to the choice of parameters and takes a few second to compute. Intermediary steps of the algorithm can be displayed to help tune the parameters.
+
+**Manual:** Requires selecting three points laying on the inner surface of the pipette on both the first and last slice. This is done by creating a point layer to napari and using the dedicated tool to add points. The three first points must be on the first slice, and the three last points on the last slice. The parameters are not used for this methods.
+
+- **Input type:**     Graylevel image
+- **Points**          Points layer for the manual method
+- **Sigma**           Standard deviation of the Gaussian filter used by the Canny filter (auto only)
+- **Low thr.**        Low threshold of the Canny filter (auto only)
+- **High thr.**       High threshold of the Canny filter (auto only)
+- **Win. size**       Size of the 2D window in which the algorithm looks for the center of the pipette (auto only)
+                      The window is centered on the image
+### 3: Thresholding
+GMM based thresholding to separate tissue from the background. The algorithm can either chose a global threshold for the whole image or compute a continuous map of local thresholds. The local method is significantly slower but helps with artifacts in the images. It works by fitting GMMs on a grid of windows to produce a sparse grid of thresholds. The threshold map is then computed by linear interpolation of the sparse grid.
+
+- **Input type:**     Graylevel image
+- **Mask:**           Pipette mask computed in step 2
+- **Spacing:**        Spacing of the GMM windows (local only)
+- **Win. size**       Size of the GMM windows, as a ratio of the spacing (local only)
+                      Window size of 0.5 results in non-overlapping but contiguous windows
+                      Higher values result in overlapping windows
+- **Components**      Number of components of the GMMs (local only)
+                      Start with 2 components
+                      Add up to 3 components if there is variation between the brightness of different object which results in missclassification of tissue
+- **Min. std**        Criteria to discard windows that do not contain tissues in the threshold map (local only)
+                      Increase if empty areas are noisy in the binary result of the thresholding
+- **Processes**
+
 
 ## Issues
 

@@ -7,7 +7,7 @@ categories: ["Annotation", "Segmentation", "Acquisition"]
 contributions:
   commands:
     - id: napari-tissue-cuboid-analysis.make_qwidget
-      pytgithon_name: napari_tissue_cuboid_analysis._widget:TissueCuboidAnalysisQWidget
+      python_name: napari_tissue_cuboid_analysis._widget:TissueCuboidAnalysisQWidget
       title: Make  Tissue Cuboid Analysis QWidget
   widgets:
     - command: napari-tissue-cuboid-analysis.make_qwidget

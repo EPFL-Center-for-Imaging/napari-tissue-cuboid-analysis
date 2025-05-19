@@ -6,13 +6,21 @@ import numpy as np
 import pandas as pd
 import trimesh
 from scipy.interpolate import NearestNDInterpolator, interpn
+from scipy.ndimage import uniform_filter1d
 from scipy.signal import find_peaks
 from scipy.stats import norm
 from skimage.color import gray2rgb
 from skimage.draw import circle_perimeter
-from skimage.feature import canny
+from skimage.feature import canny, peak_local_max
+from skimage.filters import threshold_multiotsu
 from skimage.measure import block_reduce, marching_cubes
-from skimage.morphology import closing, disk, opening
+from skimage.morphology import (
+    binary_closing,
+    binary_opening,
+    closing,
+    disk,
+    opening,
+)
 from skimage.transform import hough_circle, hough_circle_peaks
 from skimage.util import img_as_ubyte
 from sklearn.mixture import GaussianMixture
@@ -330,7 +338,7 @@ def window_gmm_wrapper(args):
     return window_gmm(*args)
 
 
-def local_threshold(
+def local_threshold_gmm(
     img: np.ndarray,
     mask: np.ndarray,
     spacing: int,
@@ -342,9 +350,10 @@ def local_threshold(
     """
     Computes a grid of thresholds by applying GMM to windows and interpolates this grid of thresholds to get a full threshold image.
     """
+    mask = mask.astype(bool)
     global IMG, MASK
     IMG = img
-    MASK = mask.astype(bool)
+    MASK = mask
 
     x_grid = np.arange(0, img.shape[0] + 1, spacing - 1)
     y_grid = np.arange(0, img.shape[1] + 1, spacing - 1)
@@ -412,13 +421,11 @@ def local_threshold(
 
     binary = img > thresh_dense
     binary &= mask
-    thresh_dense = np.zeros_like(img)
-    binary = np.zeros_like(mask)
 
     return binary, thresh_dense
 
 
-def local_threshold_simple(
+def local_threshold_gmm_simple(
     img: np.ndarray,
     mask: np.ndarray,
     spacing: int,
@@ -518,10 +525,130 @@ def local_threshold_simple(
 
     binary = img > thresh_dense
     binary &= mask
-    thresh_dense = np.zeros_like(img)
-    binary = np.zeros_like(mask)
 
     return binary, thresh_dense
+
+
+def local_threshold_multi_otsu(
+    img: np.ndarray, mask: np.ndarray, spacing: int, win_size: float
+):
+    """
+    Computes a grid of thresholds by applying GMM to windows and interpolates this grid of thresholds to get a full threshold image.
+    """
+
+    mask = mask.astype(bool)
+
+    x_grid = np.arange(0, img.shape[0] + 1, spacing - 1)
+    y_grid = np.arange(0, img.shape[1] + 1, spacing - 1)
+    z_grid = np.arange(0, img.shape[2] + 1, spacing - 1)
+    X, Y, Z = np.meshgrid(x_grid, y_grid, z_grid, indexing="ij")
+    grid_points = np.vstack([X.ravel(), Y.ravel(), Z.ravel()]).T
+
+    img_center = np.array(img.shape) // 2
+    grid_center = np.mean(grid_points, axis=0).astype(int)
+
+    grid_points -= grid_center - img_center
+
+    grid_filtered = []
+    thresh_sparse = []
+
+    win_size = int(round(spacing * win_size))  # scale to spacing
+
+    global_otsu = threshold_multiotsu(img[mask], 3).min()
+
+    for pt in tqdm(grid_points):
+        if not mask[int(pt[0]), int(pt[1]), int(pt[2])]:
+            continue
+
+        x_start = max(0, pt[0] - win_size)
+        x_end = min(pt[0] + win_size - 1, img.shape[0] - 1)
+        y_start = max(0, pt[1] - win_size)
+        y_end = min(pt[1] + win_size - 1, img.shape[1] - 1)
+        z_start = max(0, pt[2] - win_size)
+        z_end = min(pt[2] + win_size - 1, img.shape[2] - 1)
+
+        window_vals = img[x_start:x_end, y_start:y_end, z_start:z_end][
+            mask[x_start:x_end, y_start:y_end, z_start:z_end]
+        ]
+        if len(window_vals) < 10 or np.std(window_vals) < 6000:
+            continue
+
+        hist, bins = np.histogram(window_vals, 1024)
+        hist = uniform_filter1d(hist, 20)
+        peaks = peak_local_max(hist, min_distance=80, num_peaks=3)
+
+        if len(peaks) < 2:
+            continue
+
+        n_classes = min(len(peaks) + 1, 4)
+        thresh = threshold_multiotsu(classes=n_classes, hist=(hist, bins))
+        thresh = thresh[np.argmin(np.abs(thresh - global_otsu))]
+
+    grid_filtered.append(pt)
+    thresh_sparse.append(thresh)
+
+    grid_filtered = np.array(grid_filtered)
+    thresh_sparse = np.array(thresh_sparse)
+
+    interpolator = NearestNDInterpolator(grid_filtered, thresh_sparse)
+    thresh_grid = interpolator(grid_points)  # to get a regular grid
+
+    thresh_grid = thresh_grid.reshape(
+        x_grid.shape[0], y_grid.shape[0], z_grid.shape[0]
+    )
+
+    x_dense = np.arange(img.shape[0])
+    y_dense = np.arange(img.shape[1])
+    z_dense = np.arange(img.shape[2])
+
+    X, Y, Z = np.meshgrid(x_dense, y_dense, z_dense, indexing="ij")
+
+    thresh_dense = interpn(
+        points=(x_grid, y_grid, z_grid),
+        values=thresh_grid,
+        xi=(X, Y, Z),
+        method="linear",
+        bounds_error=False,
+        fill_value=None,
+    )
+
+    thresh_dense = thresh_dense.reshape(
+        x_dense.shape[0], y_dense.shape[0], z_dense.shape[0]
+    )
+    thresh_dense *= mask
+
+    return thresh_dense
+
+
+def global_threshold_multi_otsu(img, mask):
+    mask = mask.astype(bool)
+    thresh = threshold_multiotsu(img[mask], classes=3).min()
+    binary = img > thresh
+    binary &= mask
+    return binary
+
+
+def apply_threshold(img, thresh_dense, mask):
+    mask = mask.astype(bool)
+    binary = img > thresh_dense
+    binary &= mask
+    return binary
+
+
+def ball(d):
+    z, y, x = np.ogrid[:d, :d, :d]
+    b = np.zeros((d, d, d))
+    r = (d - 1) / 2
+    b = (x - r) ** 2 + (y - r) ** 2 + (z - r) ** 2 <= r**2
+    return b
+
+
+def bin_opening(binary, d):
+    return binary_opening(binary, ball(d))
+
+
+def bin_closing(binary, d):
+    return binary_closing(binary, ball(d))
 
 
 def watershed_auto_fix(
