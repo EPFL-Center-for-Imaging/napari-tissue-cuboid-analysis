@@ -6,13 +6,13 @@ import numpy as np
 import pandas as pd
 import trimesh
 from scipy.interpolate import NearestNDInterpolator, interpn
-from scipy.ndimage import uniform_filter1d
+from scipy.ndimage import binary_fill_holes, uniform_filter1d
 from scipy.signal import find_peaks
 from scipy.stats import norm
 from skimage.color import gray2rgb
 from skimage.draw import circle_perimeter
 from skimage.feature import canny, peak_local_max
-from skimage.filters import threshold_multiotsu
+from skimage.filters import threshold_multiotsu, threshold_otsu
 from skimage.measure import block_reduce, marching_cubes
 from skimage.morphology import (
     binary_closing,
@@ -20,6 +20,7 @@ from skimage.morphology import (
     closing,
     disk,
     opening,
+    remove_small_objects,
 )
 from skimage.transform import hough_circle, hough_circle_peaks
 from skimage.util import img_as_ubyte
@@ -419,10 +420,7 @@ def local_threshold_gmm(
     )
     thresh_dense *= mask
 
-    binary = img > thresh_dense
-    binary &= mask
-
-    return binary, thresh_dense
+    return thresh_dense
 
 
 def local_threshold_gmm_simple(
@@ -430,7 +428,6 @@ def local_threshold_gmm_simple(
     mask: np.ndarray,
     spacing: int,
     win_size: float,
-    n_comp: int,
     min_std: float,
 ):
     """
@@ -438,8 +435,6 @@ def local_threshold_gmm_simple(
     """
 
     mask = mask.astype(bool)
-    print(img.dtype, img.shape)
-    print(mask.dtype, mask.shape)
     x_grid = np.arange(0, img.shape[0] + 1, spacing - 1)
     y_grid = np.arange(0, img.shape[1] + 1, spacing - 1)
     z_grid = np.arange(0, img.shape[2] + 1, spacing - 1)
@@ -456,6 +451,8 @@ def local_threshold_gmm_simple(
 
     win_size = int(round(spacing * win_size))  # scale to spacing
 
+    otsu_ref = threshold_otsu(img)
+
     for i, pt in enumerate(tqdm(grid_points)):
         x_start = max(0, pt[0] - win_size)
         x_end = min(pt[0] + win_size - 1, img.shape[0] - 1)
@@ -467,6 +464,13 @@ def local_threshold_gmm_simple(
         window_vals = img[x_start:x_end, y_start:y_end, z_start:z_end][
             mask[x_start:x_end, y_start:y_end, z_start:z_end]
         ]
+
+        hist, bins = np.histogram(window_vals, 1024)
+        hist = uniform_filter1d(hist, 20)
+        peaks = peak_local_max(hist, min_distance=80, num_peaks=3)
+
+        n_comp = max(min(len(peaks), 3), 2)  # limited to [2,4]
+
         if len(window_vals) < n_comp or np.std(window_vals) < min_std:
             continue
 
@@ -486,12 +490,14 @@ def local_threshold_gmm_simple(
                 )
                 * gmm.weights_[i]
             )
-
-        minimas, _ = find_peaks(-mixture_pdf, height=-3e-5)
+        minimas = peak_local_max(-mixture_pdf)
         if len(minimas) > 0:
-            thresh = thresh_candidates[np.min(minimas)]
+            minima = minimas[
+                np.argmin(np.abs(thresh_candidates[minimas] - otsu_ref))
+            ]
+            gmm_thresh = thresh_candidates[minima]
             grid_filtered.append(pt)
-            thresh_sparse.append(thresh)
+            thresh_sparse.append(gmm_thresh)
 
     grid_filtered = np.array(grid_filtered)
     thresh_sparse = np.array(thresh_sparse)
@@ -523,10 +529,34 @@ def local_threshold_gmm_simple(
     )
     thresh_dense *= mask
 
-    binary = img > thresh_dense
+    return thresh_dense
+
+
+def global_threshold_gmm(img, mask):
+    mask = mask.astype(bool)
+    masked = img[mask]
+
+    subsample = np.random.choice(masked.ravel(), size=int(1e6), replace=False)
+
+    gmm = GaussianMixture(2, covariance_type="full")
+    gmm.fit(subsample.reshape(-1, 1))
+
+    thresh_candidates = np.arange(np.min(gmm.means_), np.max(gmm.means_), 1)
+    mixture_pdf = np.zeros_like(thresh_candidates)
+    for i in range(2):
+        mixture_pdf += norm.pdf(
+            thresh_candidates,
+            float(gmm.means_[i, 0]),
+            np.sqrt(float(gmm.covariances_[i, 0, 0])),
+        )
+
+    gmm_thresh = thresh_candidates[np.argmin(mixture_pdf)]
+
+    binary = img > gmm_thresh
+
     binary &= mask
 
-    return binary, thresh_dense
+    return binary
 
 
 def local_threshold_multi_otsu(
@@ -624,6 +654,7 @@ def global_threshold_multi_otsu(img, mask):
     mask = mask.astype(bool)
     thresh = threshold_multiotsu(img[mask], classes=3).min()
     binary = img > thresh
+    binary = binary_fill_holes(binary)
     binary &= mask
     return binary
 
@@ -631,6 +662,7 @@ def global_threshold_multi_otsu(img, mask):
 def apply_threshold(img, thresh_dense, mask):
     mask = mask.astype(bool)
     binary = img > thresh_dense
+    binary = binary_fill_holes(binary)
     binary &= mask
     return binary
 
@@ -744,6 +776,13 @@ def generate_single_cuboid(
     binary_tight = cuboid_binary_tight(labelled, label)
 
     cuboid = Cuboid(label=label, binary=binary_tight, vsize=vsize)
+
+    if cuboid.mesh is None:
+        return None, None, None
+
+    if not cuboid.mesh.is_watertight:
+        return cuboid.mesh.vertices, cuboid.mesh.faces, None
+
     cuboid.smooth(iterations=smooth_iter)
     cuboid.align()
 
@@ -770,6 +809,14 @@ def generate_multiple_cuboids_simple(
         cuboid = Cuboid(
             label=label, binary=binary_tight, vsize=vsize, dir_path=dir_path
         )
+
+        if cuboid.mesh is None:
+            df.drop(label, inplace=True)
+            continue
+        if not cuboid.mesh.is_watertight:
+            df.drop(label, inplace=True)
+            continue
+
         cuboid.smooth(iterations=smooth_iter)
         cuboid.align()
         cuboid.save()
@@ -785,6 +832,7 @@ class Cuboid:
         self.label = label
         self.voxel_size = vsize * 1e-3
         self.dir_path = dir_path
+        self.mesh = None
 
         if binary is not None:
             self.generate(binary)
@@ -806,12 +854,22 @@ class Cuboid:
             print(f"Label {self.label} not found in image")
             return
 
-        verts, faces, _, _ = marching_cubes(binary)
+        binary = binary.astype(bool)  # safety check
+
+        binary = remove_small_objects(
+            binary, min_size=100
+        )  # remove noise to avoid watertighness issues
+        try:
+            verts, faces, _, _ = marching_cubes(binary)
+        except RuntimeError:
+            return
         self.mesh = trimesh.Trimesh(verts, faces)
         self.mesh.vertices -= self.mesh.center_mass
         trimesh.repair.fix_inversion(self.mesh)
         if not self.mesh.is_watertight:
-            print(f"Mesh for cuboid {self.label} is not watertight")
+            trimesh.repair.fill_holes(self.mesh)
+            if not self.mesh.is_watertight:
+                print(f"Mesh for cuboid {self.label} is not watertight")
 
     def load(self, file_path):
         with open(file_path, "rb") as f:

@@ -51,7 +51,9 @@ from ._utils import (
     bin_opening,
     generate_multiple_cuboids_simple,
     generate_single_cuboid,
+    global_threshold_gmm,
     global_threshold_multi_otsu,
+    local_threshold_gmm_simple,
     local_threshold_multi_otsu,
     merge_labels,
     pipette_mask_auto,
@@ -215,12 +217,23 @@ class ThresholdGB(QGroupBox):
         self.local_button.setCheckable(True)
         self.local_button.setChecked(True)
 
+        self.otsu_button = QPushButton("Otsu")
+        self.otsu_button.setCheckable(True)
+        self.otsu_button.setChecked(False)
+
+        self.gmm_button = QPushButton("GMM")
+        self.gmm_button.setCheckable(True)
+        self.gmm_button.setChecked(True)
+
         self.spacing_spinbox = create_widget(
             annotation=int, options={"min": 3, "value": 52}
         )
         self.win_size_spinbox = create_widget(
             annotation=float,
-            options={"min": 0.1, "max": 2, "value": 1, "step": 0.1},
+            options={"min": 0.1, "max": 2, "value": 0.6, "step": 0.1},
+        )
+        self.min_std_spinbox = create_widget(
+            annotation=float, options={"value": 4000}
         )
 
         self.plot_thresh_cb = CheckBox(value=False, text="Plot thresh.")
@@ -246,15 +259,31 @@ class ThresholdGB(QGroupBox):
         self.layout.addWidget(QLabel("Mask"), 1, 0)
         self.layout.addWidget(self.mask_combo.native, 1, 1, 1, 2)
 
-        self.layout.addWidget(QLabel("Spacing"), 2, 0)
-        self.layout.addWidget(self.spacing_spinbox.native, 2, 1, 1, 2)
-        self.layout.addWidget(QLabel("Win. size"), 3, 0)
-        self.layout.addWidget(self.win_size_spinbox.native, 3, 1, 1, 2)
+        self.layout.addWidget(QLabel("Method"), 2, 0)
+        self.layout.addWidget(self.otsu_button, 2, 1)
+        self.layout.addWidget(self.gmm_button, 2, 2)
 
-        self.layout.addWidget(self.plot_thresh_cb.native, 4, 0)
-        self.layout.addWidget(self.run_button.native, 4, 1, 1, 2)
+        self.layout.addWidget(QLabel("Spacing"), 3, 0)
+        self.layout.addWidget(self.spacing_spinbox.native, 3, 1, 1, 2)
+        self.layout.addWidget(QLabel("Win. size"), 4, 0)
+        self.layout.addWidget(self.win_size_spinbox.native, 4, 1, 1, 2)
+        self.layout.addWidget(QLabel("Min. std"), 5, 0)
+        self.layout.addWidget(self.min_std_spinbox.native, 5, 1, 1, 2)
+
+        self.layout.addWidget(self.plot_thresh_cb.native, 6, 0)
+        self.layout.addWidget(self.run_button.native, 6, 1, 1, 2)
 
         self.run_button.clicked.connect(self._run_threshold)
+        self.gmm_button.clicked.connect(self._toggle_otsu_off)
+        self.otsu_button.clicked.connect(self._toggle_gmm_off)
+
+    def _toggle_otsu_off(self):
+        if self.gmm_button.isChecked():
+            self.otsu_button.setChecked(False)
+
+    def _toggle_gmm_off(self):
+        if self.otsu_button.isChecked():
+            self.gmm_button.setChecked(False)
 
     def _run_threshold(self):
         img_layer = self.input_img_combo.value
@@ -266,24 +295,53 @@ class ThresholdGB(QGroupBox):
 
         spacing = self.spacing_spinbox.value
         win_size = self.win_size_spinbox.value
+        min_std = self.min_std_spinbox.value
         plot = self.plot_thresh_cb.value
 
-        if local:
-            thresh_map = local_threshold_multi_otsu(
-                img, mask, spacing, win_size
-            )
-            binary = apply_threshold(img, thresh_map, mask)
-            if plot:
-                contrast = [np.min(thresh_map[mask]), np.max[thresh_map[mask]]]
-                self.viewer.add_image(
-                    thresh_map,
-                    colormap="inferno",
-                    name="Threshold map",
-                    visibility=False,
-                    contrast_limits=contrast,
+        if self.gmm_button.isChecked():
+            if local:
+                thresh_map = local_threshold_gmm_simple(
+                    img, mask, spacing, win_size, min_std
                 )
+                binary = apply_threshold(img, thresh_map, mask)
+
+                if plot:
+                    contrast = [
+                        np.min(thresh_map[mask]),
+                        np.max[thresh_map[mask]],
+                    ]
+                    self.viewer.add_image(
+                        thresh_map,
+                        name="Threshold map",
+                        visible=False,
+                        contrast_limits=contrast,
+                    )
+            else:
+                binary = global_threshold_gmm(img, mask)
+
+        elif self.otsu_button.isChecked():
+            if local:
+                thresh_map = local_threshold_multi_otsu(
+                    img, mask, spacing, win_size
+                )
+                binary = apply_threshold(img, thresh_map, mask)
+                if plot:
+                    contrast = [
+                        np.min(thresh_map[mask]),
+                        np.max(thresh_map[mask]),
+                    ]
+                    self.viewer.add_image(
+                        thresh_map,
+                        name="Threshold map",
+                        visible=False,
+                        contrast_limits=contrast,
+                    )
+            else:
+                binary = global_threshold_multi_otsu(img, mask)
+
         else:
-            binary = global_threshold_multi_otsu(img, mask)
+            print("Select a method first")
+            return
 
         self.viewer.add_labels(binary, name="Binary")
 
@@ -300,7 +358,9 @@ class MorphologyGB(QGroupBox):
         self.layout = QGridLayout()
         self.setLayout(self.layout)
 
-        self.input_binary_combo = create_widget(annotation=napari.layers.Image)
+        self.input_binary_combo = create_widget(
+            annotation=napari.layers.Labels
+        )
 
         self.d_spinbox = create_widget(
             annotation=int, options={"min": 3, "value": 3, "step": 2}
@@ -540,6 +600,10 @@ class MeshGB(QGroupBox):
                 labels, label, vsize, smooth_iter
             )
 
+            if vertices is None:
+                print(f"Could not build mesh for cuboid {label}")
+                return
+
             for layer in self.viewer.layers:
                 layer.visible = False
 
@@ -549,11 +613,14 @@ class MeshGB(QGroupBox):
 
             self.viewer.camera.center = tuple(vertices.mean(axis=0))
 
-            print(f"Cuboid{label}")
-            print(
-                f"volume:{metrics[0]:.2e}   compactness: {metrics[1]:.3f}   convexity: {metrics[2]:.3f}"
-            )
-            print(f"IoU: {metrics[3]:.3f}   inertia ratio:{metrics[4]:.3f}")
+            if metrics is not None:
+                print(f"Cuboid{label}")
+                print(
+                    f"volume:{metrics[0]:.2e}   compactness: {metrics[1]:.3f}   convexity: {metrics[2]:.3f}"
+                )
+                print(
+                    f"IoU: {metrics[3]:.3f}   inertia ratio:{metrics[4]:.3f}"
+                )
 
         else:
             generate_multiple_cuboids_simple(
