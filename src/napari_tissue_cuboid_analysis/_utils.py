@@ -675,12 +675,58 @@ def ball(d):
     return b
 
 
-def bin_opening(binary, d):
-    return binary_opening(binary, ball(d))
+def bin_opening(labels, d, single=None):
+    labels = labels.astype(np.uint16)
+    opened = np.zeros_like(labels)
+
+    if labels.max() <= 1:
+        return binary_opening(labels, ball(d))
+
+    elif single is not None:
+        binary, z0, z1, y0, y1, x0, x1 = cuboid_binary_tight(
+            labels, single, pad_width=(d // 2 + 1)
+        )
+        binary = binary_opening(binary, ball(d))
+
+        opened[z0:z1, y0:y1, x0:x1][binary] = single
+
+    else:
+        for label in tqdm(range(1, labels.max() + 1)):
+            binary, z0, z1, y0, y1, x0, x1 = cuboid_binary_tight(
+                labels, label, pad_width=(d // 2 + 1)
+            )
+            binary = binary_opening(binary, ball(d))
+
+            opened[z0:z1, y0:y1, x0:x1][binary] = label
+
+    return opened
 
 
-def bin_closing(binary, d):
-    return binary_closing(binary, ball(d))
+def bin_closing(labels, d, single=None):
+    labels = labels.astype(np.uint16)
+    closed = labels.copy()
+
+    if closed.max() <= 1:
+        return binary_closing(closed, ball(d))
+
+    elif single is not None:
+        binary, z0, z1, y0, y1, x0, x1 = cuboid_binary_tight(
+            closed, single, pad_width=(d // 2 + 1)
+        )
+        binary = binary_closing(binary, ball(d))
+
+        closed[z0:z1, y0:y1, x0:x1][binary] = single
+
+    else:
+        for label in tqdm(range(1, closed.max() + 1)):
+            binary, z0, z1, y0, y1, x0, x1 = cuboid_binary_tight(
+                closed, label, pad_width=(d // 2 + 1)
+            )
+            binary = binary_closing(binary, ball(d))
+
+            closed[z0:z1, y0:y1, x0:x1][binary] = label
+
+    return closed
 
 
 def watershed_auto_fix(
@@ -752,28 +798,37 @@ def split_labels(
     return split
 
 
-def cuboid_binary_tight(labelled: np.ndarray, label: int):
+def cuboid_binary_tight(labelled: np.ndarray, label: int, pad_width: int = 1):
     if not np.any(labelled == label):
         print(f"Label{label} doesn't appear in provided image")
         return None
 
     z, y, x = np.where(labelled == label)
 
-    z0, z1 = z.min(), z.max() + 1
-    y0, y1 = y.min(), y.max() + 1
-    x0, x1 = x.min(), x.max() + 1
+    z0, z1 = z.min() - pad_width, z.max() + pad_width + 1
+    y0, y1 = y.min() - pad_width, y.max() + pad_width + 1
+    x0, x1 = x.min() - pad_width, x.max() + pad_width + 1
+
+    z0 = max(z0, 0)
+    z1 = min(z1, labelled.shape[0] + 1)
+    y0 = max(y0, 0)
+    y1 = min(y1, labelled.shape[1] + 1)
+    x0 = max(x0, 0)
+    x1 = min(x1, labelled.shape[2] + 1)
 
     tight = labelled[z0:z1, y0:y1, x0:x1]
-    padded = np.pad(tight, pad_width=1, mode="constant", constant_values=0)
-    binary = (padded == label).astype(bool)
+    binary = (tight == label).astype(bool)
 
-    return binary
+    return binary, z0, z1, y0, y1, x0, x1
 
 
 def generate_single_cuboid(
     labelled: np.ndarray, label: int, vsize: float, smooth_iter: int
 ):
-    binary_tight = cuboid_binary_tight(labelled, label)
+    binary_tight, *_ = cuboid_binary_tight(labelled, label)
+    binary_tight = np.pad(
+        binary_tight, pad_width=1, mode="constant", constant_values=0
+    )
 
     cuboid = Cuboid(label=label, binary=binary_tight, vsize=vsize)
 
@@ -794,7 +849,11 @@ def generate_single_cuboid(
 
 
 def generate_multiple_cuboids_simple(
-    labelled: np.ndarray, vsize: float, smooth_iter: int, dir_path: str = None
+    labelled: np.ndarray,
+    vsize: float,
+    smooth_iter: int,
+    dir_path: str = None,
+    metrics_only: bool = False,
 ):
     if not os.path.exists(dir_path):
         os.makedirs(dir_path)
@@ -804,7 +863,10 @@ def generate_multiple_cuboids_simple(
     df = pd.DataFrame(0.0, index=np.arange(1, n + 1), columns=columns)
 
     for label in tqdm(range(1, n + 1), desc="Generating"):
-        binary_tight = cuboid_binary_tight(labelled, label)
+        binary_tight, *_ = cuboid_binary_tight(labelled, label)
+        binary_tight = np.pad(
+            binary_tight, pad_width=1, mode="constant", constant_values=0
+        )
 
         cuboid = Cuboid(
             label=label, binary=binary_tight, vsize=vsize, dir_path=dir_path
@@ -819,7 +881,9 @@ def generate_multiple_cuboids_simple(
 
         cuboid.smooth(iterations=smooth_iter)
         cuboid.align()
-        cuboid.save()
+
+        if not metrics_only:
+            cuboid.save()
 
         df.loc[label] = cuboid.metrics()
 

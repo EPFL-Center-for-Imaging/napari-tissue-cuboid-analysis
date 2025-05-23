@@ -292,6 +292,7 @@ class ThresholdGB(QGroupBox):
 
         mask_layer = self.mask_combo.value
         mask = mask_layer.data
+        mask = mask.astype(bool)
 
         spacing = self.spacing_spinbox.value
         win_size = self.win_size_spinbox.value
@@ -308,7 +309,7 @@ class ThresholdGB(QGroupBox):
                 if plot:
                     contrast = [
                         np.min(thresh_map[mask]),
-                        np.max[thresh_map[mask]],
+                        np.max(thresh_map[mask]),
                     ]
                     self.viewer.add_image(
                         thresh_map,
@@ -358,54 +359,65 @@ class MorphologyGB(QGroupBox):
         self.layout = QGridLayout()
         self.setLayout(self.layout)
 
-        self.input_binary_combo = create_widget(
+        self.input_labels_combo = create_widget(
             annotation=napari.layers.Labels
         )
 
         self.d_spinbox = create_widget(
             annotation=int, options={"min": 3, "value": 3, "step": 2}
         )
+        self.single_cb = CheckBox(text="Single", value=True)
+        self.single_spinbox = create_widget(
+            annotation=int, options={"min": 1, "value": 1}
+        )
         self.open_button = Button(label="Open")
         self.close_button = Button(label="Close")
 
         self.viewer.layers.events.inserted.connect(
-            self.input_binary_combo.reset_choices
+            self.input_labels_combo.reset_choices
         )
         self.viewer.layers.events.removed.connect(
-            self.input_binary_combo.reset_choices
+            self.input_labels_combo.reset_choices
         )
 
         self.layout.addWidget(QLabel("Input"), 0, 0)
-        self.layout.addWidget(self.input_binary_combo.native, 0, 1)
+        self.layout.addWidget(self.input_labels_combo.native, 0, 1)
 
         self.layout.addWidget(QLabel("Diameter"), 2, 0)
         self.layout.addWidget(self.d_spinbox.native, 2, 1)
 
-        self.layout.addWidget(self.open_button.native, 3, 0)
-        self.layout.addWidget(self.close_button.native, 3, 1)
+        self.layout.addWidget(self.single_cb.native, 3, 0)
+        self.layout.addWidget(self.single_spinbox.native, 3, 1)
+
+        self.layout.addWidget(self.open_button.native, 4, 0)
+        self.layout.addWidget(self.close_button.native, 4, 1)
 
         self.open_button.clicked.connect(self._run_opening)
         self.close_button.clicked.connect(self._run_closing)
 
     def _run_opening(self):
-        binary_layer = self.input_binary_combo.value
-        binary = binary_layer.data
-
+        labels_layer = self.input_labels_combo.value
+        labels = labels_layer.data
+        name = labels_layer.name
         diameter = self.d_spinbox.value
 
-        opened = bin_opening(binary, diameter)
+        single = self.single_spinbox.value if self.single_cb.value else None
 
-        self.viewer.add_labels(opened, name="BinaryFiltered")
+        closed = bin_opening(labels, diameter, single)
+
+        self.viewer.add_labels(closed, name=name + "Filtered")
 
     def _run_closing(self):
-        binary_layer = self.input_binary_combo.value
-        binary = binary_layer.data
-
+        labels_layer = self.input_labels_combo.value
+        labels = labels_layer.data
+        name = labels_layer.name
         diameter = self.d_spinbox.value
 
-        closed = bin_closing(binary, diameter)
+        single = self.single_spinbox.value if self.single_cb.value else None
 
-        self.viewer.add_labels(closed, name="BinaryFiltered")
+        closed = bin_closing(labels, diameter, single)
+
+        self.viewer.add_labels(closed, name=name + "Filtered")
 
 
 class LabelGB(QGroupBox):
@@ -550,7 +562,7 @@ class MeshGB(QGroupBox):
             annotation=int, options={"min": 0, "value": 20}
         )
         self.voxel_spinbox = create_widget(
-            annotation=float, options={"value": 600}
+            annotation=float, options={"value": 0.6}
         )
         self.sample_cb = CheckBox(value=True, text="Single label:")
         self.sample_spinbox = create_widget(
