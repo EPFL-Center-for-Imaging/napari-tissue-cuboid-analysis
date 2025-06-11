@@ -139,7 +139,7 @@ Saves a mesh for each cuboid at the specified location in `.stl` format, as well
 Allows you to browse through the cuboids. Each page displays four cuboids, you can scroll through pages using the &larr; and &rarr; keys. Metrics for each cuboid are displayed in the top left corner. You can display the *similar cubes* (same volume and similar orientation) using the `c` key.
 
 ### Usage:
-Download the script from the package examples and run:
+[Download the script](https://github.com/EPFL-Center-for-Imaging/napari-tissue-cuboid-analysis/tree/main/examples) from the package examples and run:
 
     python pyvista_cuboid_viewer.py path_to_cuboids_data
 
