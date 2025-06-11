@@ -7,12 +7,11 @@ import pandas as pd
 import trimesh
 from scipy.interpolate import NearestNDInterpolator, interpn
 from scipy.ndimage import binary_fill_holes, uniform_filter1d
-from scipy.signal import find_peaks
 from scipy.stats import norm
 from skimage.color import gray2rgb
 from skimage.draw import circle_perimeter
 from skimage.feature import canny, peak_local_max
-from skimage.filters import threshold_multiotsu, threshold_otsu
+from skimage.filters import threshold_multiotsu
 from skimage.measure import block_reduce, marching_cubes
 from skimage.morphology import (
     binary_closing,
@@ -61,7 +60,6 @@ def extract_pipette_2D(
     canny_sigma: int = 2,
     canny_thresh: tuple = (5, 8),
     win_size: int = 7,
-    auto: bool = True,
     plot: bool = False,
     verbose: bool = False,
 ) -> tuple[int, np.ndarray]:
@@ -79,7 +77,7 @@ def extract_pipette_2D(
     - center (np.ndarray): coordinates of the pipette center
     - plt_img (np.ndarray): display of canny edges and circle detection
     """
-    sample_frame = img_as_ubyte(slice)
+    sample_frame = img_as_ubyte(slice_2D)
     opened = opening(sample_frame, disk(3))  # tune if size of image changes
     closed = closing(opened, disk(3))
 
@@ -282,19 +280,34 @@ def pipette_mask_manual(img: np.ndarray, points: np.ndarray):
     return pipette_mask
 
 
+# global definition of heavy variables to reduce RAM load in multiprocessing
 IMG = None
 MASK = None
 
 
 def window_gmm(
-    idx: int,
+    win_id: int,
     pt: np.ndarray,
     win_size: float,
     min_std: float,
-    n_comp: int,
-    peak_height: float = -3e-5,
+    global_thresh: float,
 ):
-    # print(f'worker {id}', flush=True)
+    """
+    Applies the GMM thresholding algorithm to a single window. Used for parallel computation of the local threshold.
+
+    Args:
+    - win_id (int): id of the window
+    - pt (np.ndarray): center point of the window in the image
+    - win_size (int): size of the local window
+    - min_std (float): minimum std of the window to be valid
+    - global_thresh (float): reference global threshold for minima selection
+
+    Returns:
+    - id (int): id of the window
+    - valid (bool): wether the window results in a valid threshold
+    - threshold (float): threshold computed from the GMM
+    """
+
     valid = False
     thresh = 0
 
@@ -308,13 +321,24 @@ def window_gmm(
     window_vals = IMG[x_start:x_end, y_start:y_end, z_start:z_end][
         MASK[x_start:x_end, y_start:y_end, z_start:z_end]
     ]
-    if len(window_vals) < n_comp or np.std(window_vals) < min_std:
-        valid = False
-        return id, valid, thresh
+
+    hist, _ = np.histogram(window_vals, 1024)
+    hist = uniform_filter1d(
+        hist, 20
+    )  # smooth histogram to remove high frequency peaks
+    peaks = peak_local_max(hist, min_distance=80, num_peaks=3)
+
+    n_comp = max(min(len(peaks), 4), 2)  # limited to [2,4]
+
+    if (
+        len(window_vals) < n_comp or np.std(window_vals) < min_std
+    ):  # discard unstable edge cases and windows not containing any tissue
+        return win_id, valid, thresh
 
     gmm = GaussianMixture(n_components=n_comp)
     gmm.fit(window_vals.reshape(-1, 1))
 
+    # only accept threshold candidates between the first and last Gaussian means in the pdf
     thresh_candidates = np.arange(np.min(gmm.means_), np.max(gmm.means_), 1)
     mixture_pdf = np.zeros_like(thresh_candidates)
     for i in range(n_comp):
@@ -326,16 +350,21 @@ def window_gmm(
             )
             * gmm.weights_[i]
         )
-
-    minimas, _ = find_peaks(-mixture_pdf, height=peak_height)
+    minimas = peak_local_max(-mixture_pdf)
     if len(minimas) > 0:
+        minima = minimas[
+            np.argmin(
+                np.abs(thresh_candidates[minimas] - global_thresh)
+            )  # chose the minima that is closest to the global reference
+        ]
+        thresh = thresh_candidates[minima]
         valid = True
-        thresh = thresh_candidates[np.min(minimas)]
 
-    return id, valid, thresh
+    return win_id, valid, thresh
 
 
 def window_gmm_wrapper(args):
+    # wrapper function to unpack the parameters for multiprocessing
     return window_gmm(*args)
 
 
@@ -344,12 +373,23 @@ def local_threshold_gmm(
     mask: np.ndarray,
     spacing: int,
     win_size: float,
-    n_comp: int,
     min_std: float,
     n_processes: int,
 ):
     """
-    Computes a grid of thresholds by applying GMM to windows and interpolates this grid of thresholds to get a full threshold image.
+    Computes a grid of thresholds by fitting GMM to a grid of windows and interpolates this grid to get a full threshold map. Using multiprocessing to paralellise the gmm fitting process
+
+    Args:
+    - img (np.ndarray): image on which the local thresholding operation is performed
+    - mask (np.ndarray): boolean mask to exlude voxels that lie outside the region of interest
+    - spacing (int): spacing between the local windows
+    - win_size (float): size of the windows, as a fraction of the spacing
+    - min_std (float): minimum std of the window to be valid
+    - n_processes (int): number of processes to be run in parallel
+
+    Returns:
+    - thresh_dense (np.ndarray): dense threshold map of the same dimensions as the input image
+    - grid_filtered (np.ndarray): grid points that resulted in a valid window from which a local threshold was computed prior to interpolation
     """
     mask = mask.astype(bool)
     global IMG, MASK
@@ -365,14 +405,17 @@ def local_threshold_gmm(
     img_center = np.array(img.shape) // 2
     grid_center = np.mean(grid_points, axis=0).astype(int)
 
+    _, global_thresh = global_threshold_gmm(img, mask)
+
     grid_points -= grid_center - img_center
 
     input_data = []
     win_size = int(round(spacing * win_size))  # scale to spacing
-    print(spacing, win_size, grid_points.shape)
+
+    min_std *= np.std(img)  # absolute thresh from relative thresh
 
     for i, pt in enumerate(grid_points):
-        input_data.append((i, pt, win_size, min_std, n_comp))
+        input_data.append((i, pt, win_size, min_std, global_thresh))
 
     with Pool(processes=n_processes) as pool:
         # use imap to allow progress bar, unordered for faster processing
@@ -380,6 +423,7 @@ def local_threshold_gmm(
             tqdm(
                 pool.imap_unordered(window_gmm_wrapper, input_data),
                 total=len(input_data),
+                desc="Local windows",
             )
         )
     # reorder results
@@ -420,7 +464,7 @@ def local_threshold_gmm(
     )
     thresh_dense *= mask
 
-    return thresh_dense
+    return thresh_dense, grid_filtered
 
 
 def local_threshold_gmm_simple(
@@ -431,7 +475,18 @@ def local_threshold_gmm_simple(
     min_std: float,
 ):
     """
-    Computes a grid of thresholds by applying GMM to windows and interpolates this grid of thresholds to get a full threshold image.
+    Computes a grid of thresholds by fitting GMM to a grid of windows and interpolates this grid to get a full threshold map.
+
+    Args:
+    - img (np.ndarray): image on which the local thresholding operation is performed
+    - mask (np.ndarray): boolean mask to exlude voxels that lie outside the region of interest
+    - spacing (int): spacing between the local windows
+    - win_size (float): size of the windows, as a fraction of the spacing
+    - min_std (float): minimum std of the window to be valid
+
+    Returns:
+    - thresh_dense (np.ndarray): dense threshold map of the same dimensions as the input image
+    - grid_filtered (np.ndarray): grid points that resulted in a valid window from which a local threshold was computed prior to interpolation
     """
 
     mask = mask.astype(bool)
@@ -451,9 +506,10 @@ def local_threshold_gmm_simple(
 
     win_size = int(round(spacing * win_size))  # scale to spacing
 
-    otsu_ref = threshold_otsu(img)
+    _, global_thresh = global_threshold_gmm(img, mask)
+    min_std *= np.std(img)  # absolute thresh from relative thresh
 
-    for i, pt in enumerate(tqdm(grid_points)):
+    for i, pt in enumerate(tqdm(grid_points, desc="Local windows")):
         x_start = max(0, pt[0] - win_size)
         x_end = min(pt[0] + win_size - 1, img.shape[0] - 1)
         y_start = max(0, pt[1] - win_size)
@@ -465,18 +521,22 @@ def local_threshold_gmm_simple(
             mask[x_start:x_end, y_start:y_end, z_start:z_end]
         ]
 
-        hist, bins = np.histogram(window_vals, 1024)
+        hist, _ = np.histogram(
+            window_vals, 1024
+        )  # smooth histogram to remove high frequency peaks
         hist = uniform_filter1d(hist, 20)
         peaks = peak_local_max(hist, min_distance=80, num_peaks=3)
 
-        n_comp = max(min(len(peaks), 3), 2)  # limited to [2,4]
+        n_comp = max(min(len(peaks), 4), 2)  # limited to [2,4]
 
-        if len(window_vals) < n_comp or np.std(window_vals) < min_std:
+        if (
+            len(window_vals) < n_comp or np.std(window_vals) < min_std
+        ):  # discard edge cases and windows not containing any tissue
             continue
 
         gmm = GaussianMixture(n_components=n_comp)
         gmm.fit(window_vals.reshape(-1, 1))
-
+        # only accept threshold candidates between the first and last Gaussian means in the pdf
         thresh_candidates = np.arange(
             np.min(gmm.means_), np.max(gmm.means_), 1
         )
@@ -493,7 +553,9 @@ def local_threshold_gmm_simple(
         minimas = peak_local_max(-mixture_pdf)
         if len(minimas) > 0:
             minima = minimas[
-                np.argmin(np.abs(thresh_candidates[minimas] - otsu_ref))
+                np.argmin(
+                    np.abs(thresh_candidates[minimas] - global_thresh)
+                )  # only accept threshold candidates between the first and last Gaussian means in the pdf
             ]
             gmm_thresh = thresh_candidates[minima]
             grid_filtered.append(pt)
@@ -502,8 +564,11 @@ def local_threshold_gmm_simple(
     grid_filtered = np.array(grid_filtered)
     thresh_sparse = np.array(thresh_sparse)
 
+    print("Interpolation in progress...")
     interpolator = NearestNDInterpolator(grid_filtered, thresh_sparse)
-    thresh_grid = interpolator(grid_points)  # to get a regular grid
+    thresh_grid = interpolator(
+        grid_points
+    )  # to get a rectangular/regular grid
 
     thresh_grid = thresh_grid.reshape(
         x_grid.shape[0], y_grid.shape[0], z_grid.shape[0]
@@ -529,10 +594,21 @@ def local_threshold_gmm_simple(
     )
     thresh_dense *= mask
 
-    return thresh_dense
+    return thresh_dense, grid_filtered
 
 
 def global_threshold_gmm(img, mask):
+    """
+    Computes a global thresholds by fitting a GMM to the intensity histogram of an image.
+
+    Args:
+    - img (np.ndarray): image on which the thresholding operation is performed
+    - mask (np.ndarray): boolean mask to exlude voxels that lie outside the region of interest
+
+    Returns:
+    - binary (np.ndarray): binary image resulting from the thresolding operation
+    """
+
     mask = mask.astype(bool)
     masked = img[mask]
 
@@ -551,19 +627,29 @@ def global_threshold_gmm(img, mask):
         )
 
     gmm_thresh = thresh_candidates[np.argmin(mixture_pdf)]
-
     binary = img > gmm_thresh
 
     binary &= mask
+    binary = binary_fill_holes(binary)  # fill closed holes
 
-    return binary
+    return binary, gmm_thresh
 
 
 def local_threshold_multi_otsu(
     img: np.ndarray, mask: np.ndarray, spacing: int, win_size: float
 ):
     """
-    Computes a grid of thresholds by applying GMM to windows and interpolates this grid of thresholds to get a full threshold image.
+    Computes a grid of thresholds by applying multi-otsu thresholding to windows and interpolates this grid of thresholds to get a full threshold map.
+
+    Args:
+    - img (np.ndarray): image on which the local thresholding operation is performed
+    - mask (np.ndarray): boolean mask to exlude voxels that lie outside the region of interest
+    - spacing (int): spacing between the local windows
+    - win_size (float): size of the windows, as a fraction of the spacing
+
+    Returns:
+    - thresh_dense (np.ndarray): dense threshold map of the same dimensions as the input image
+    - grid_filtered (np.ndarray): grid points that resulted in a valid window from which a local threshold was computed prior to interpolation
     """
 
     mask = mask.astype(bool)
@@ -586,7 +672,7 @@ def local_threshold_multi_otsu(
 
     global_otsu = threshold_multiotsu(img[mask], 3).min()
 
-    for pt in tqdm(grid_points):
+    for pt in tqdm(grid_points, desc="Local windows"):
         if not mask[int(pt[0]), int(pt[1]), int(pt[2])]:
             continue
 
@@ -647,19 +733,43 @@ def local_threshold_multi_otsu(
     )
     thresh_dense *= mask
 
-    return thresh_dense
+    return thresh_dense, thresh_grid
 
 
 def global_threshold_multi_otsu(img, mask):
+    """
+    Computes a global thresholds using multi-otsu thresholding to the intensity histogram of an image.
+
+    Args:
+    - img (np.ndarray): image on which the thresholding operation is performed
+    - mask (np.ndarray): boolean mask to exlude voxels that lie outside the region of interest
+
+    Returns:
+    - binary (np.ndarray): binary image resulting from the thresolding operation
+    """
+
     mask = mask.astype(bool)
+
     thresh = threshold_multiotsu(img[mask], classes=3).min()
     binary = img > thresh
+
     binary = binary_fill_holes(binary)
     binary &= mask
     return binary
 
 
 def apply_threshold(img, thresh_dense, mask):
+    """
+    Applies the local threshold map to an image
+
+    Args:
+    - img (np.ndarray): image on which the thresholding operation is performed
+    - thresh_dense (np.ndarray): dense threshold map of the same dimensions as the input image
+    - mask (np.ndarray): boolean mask to exlude voxels that lie outside the region of interest
+
+    Returns:
+    - binary (np.ndarray): binary image resulting from the thresolding operation
+    """
     mask = mask.astype(bool)
     binary = img > thresh_dense
     binary = binary_fill_holes(binary)
@@ -667,7 +777,17 @@ def apply_threshold(img, thresh_dense, mask):
     return binary
 
 
-def ball(d):
+def ball(d: int):
+    """
+    Constructs a spherical structuring element for morphology
+
+    Args:
+    - d (int): diameter of the ball, should be odd
+
+    Returns:
+    - b (np.ndarray): structuring element of the specified diameter
+    """
+
     z, y, x = np.ogrid[:d, :d, :d]
     b = np.zeros((d, d, d))
     r = (d - 1) / 2
@@ -675,7 +795,19 @@ def ball(d):
     return b
 
 
-def bin_opening(labels, d, single=None):
+def bin_opening(labels: np.ndarray, d: int, single: bool = None):
+    """
+    Applies binary morphological opening to the input image. If the image contains non-binary labels, opening is applied to each label individually.
+
+    Args:
+    - labels (np.ndarray): input labels to which opening is applied
+    - d (int): diameter of the spherical structuring element
+    - single (int): which label should opening be applied to. If None, opening is applied to all labels. Only valid for non-binary images.
+
+    Returns:
+    - opened (np.ndarray): opened image
+    """
+
     labels = labels.astype(np.uint16)
     opened = np.zeros_like(labels)
 
@@ -691,7 +823,7 @@ def bin_opening(labels, d, single=None):
         opened[z0:z1, y0:y1, x0:x1][binary] = single
 
     else:
-        for label in tqdm(range(1, labels.max() + 1)):
+        for label in tqdm(range(1, labels.max() + 1), desc="Opening"):
             binary, z0, z1, y0, y1, x0, x1 = cuboid_binary_tight(
                 labels, label, pad_width=(d // 2 + 1)
             )
@@ -703,6 +835,18 @@ def bin_opening(labels, d, single=None):
 
 
 def bin_closing(labels, d, single=None):
+    """
+    Applies binary morphological closing to the input image. If the image contains non-binary labels, closing is applied to each label individually.
+
+    Args:
+    - labels (np.ndarray): input labels to which closing is applied
+    - d (int): diameter of the spherical structuring element
+    - single (int): which label should closing be applied to. If None, closing is applied to all labels. Only valid for non-binary images.
+
+    Returns:
+    - closed (np.ndarray): closed image
+    """
+
     labels = labels.astype(np.uint16)
     closed = labels.copy()
 
@@ -714,15 +858,17 @@ def bin_closing(labels, d, single=None):
             closed, single, pad_width=(d // 2 + 1)
         )
         binary = binary_closing(binary, ball(d))
+        binary = binary_fill_holes(binary)
 
         closed[z0:z1, y0:y1, x0:x1][binary] = single
 
     else:
-        for label in tqdm(range(1, closed.max() + 1)):
+        for label in tqdm(range(1, closed.max() + 1), desc="Closing"):
             binary, z0, z1, y0, y1, x0, x1 = cuboid_binary_tight(
                 closed, label, pad_width=(d // 2 + 1)
             )
             binary = binary_closing(binary, ball(d))
+            binary = binary_fill_holes(binary)
 
             closed[z0:z1, y0:y1, x0:x1][binary] = label
 
@@ -732,11 +878,24 @@ def bin_closing(labels, d, single=None):
 def watershed_auto_fix(
     binary: np.ndarray, watershed_lvl: int, overseg_threshold: float
 ):
+    """
+    Applies the watershed algorithm to a binary image to extract object labels. Oversegmentation is fixed automatically detected and fixed.
 
+    Args:
+    - binary (np.ndarray): input binary image
+    - wateshed_lvl (int): threshold to merge shallow basins in the watershed algorithm (parameter of the watershed algorithm).
+    - overseg_threshold (float): over-segmentation coefficient necessary to merge two regions
+
+    Returns:
+    - image iterations (list): list containing the original output watershed as well as intermediary and final result of over-segmentation fixing
+    """
+    print("Watershed in progress...")
     labelled = watershed(binary=binary, watershedLevel=watershed_lvl)
 
     max_iter = 20  # safeguard to avoid infinite loop
     image_iterations = [labelled]
+
+    print("Fixing over-segmentation...")
     for i in range(max_iter):
         over_seg_coeff, touching_labels = detectOverSegmentation(
             image_iterations[i]
@@ -753,12 +912,22 @@ def watershed_auto_fix(
     return image_iterations
 
 
-def merge_labels(labelled: np.ndarray, targets: np.ndarray):
+def merge_labels(labelled: np.ndarray, targets: list):
+    """
+    Merges N labels in an image and reorders the labels to avoid empty labels
+
+    Args:
+    - labelled (np.ndarray): input labelled image
+    - targets (list): list of labels to be merged
+
+    Returns:
+    - merged (np.ndarray): new labelled image with merged target labels
+    """
     merged = labelled.copy()
     mask = np.isin(labelled, targets[1:])
     merged[mask] = targets[0]
 
-    for i in range(np.max(merged)):
+    for i in reversed(range(np.max(merged))):
         if not np.any(merged == i):
             mask = np.isin(merged, np.arange(i + 1, np.max(merged) + 1))
             merged[mask] -= 1
@@ -769,9 +938,21 @@ def merge_labels(labelled: np.ndarray, targets: np.ndarray):
 def split_labels(
     labelled: np.ndarray,
     binary: np.array,
-    targets: np.ndarray,
+    targets: list,
     watershed_lvl: int,
 ):
+    """
+    Splits a set of labels in an image by reapplying watershed on a specific region of the image.
+
+    Args:
+    - labelled (np.ndarray): input labelled image
+    - binary (np.ndarray): binary image before labelling
+    - targets (list): list of labels to be merged
+    - watershed_lvl: threshold to merge shallow basins in the watershed algorithm. Should be smaller than the one used to compute the original labels in order to split the target labels.
+
+    Returns:
+    - split (np.ndarray): new labelled image with split target labels
+    """
 
     voronoi = setVoronoi(labelled, maxPoreRadius=4)
     target_mask = np.isin(voronoi, targets)
@@ -799,12 +980,26 @@ def split_labels(
 
 
 def cuboid_binary_tight(labelled: np.ndarray, label: int, pad_width: int = 1):
+    """
+    Extracts the binary image of a target label with minimal dimensions.
+
+    Args:
+    - labelled (np.ndarray): input labelled image
+    - label (int): target label
+    - pad_width (int): number of layers of zero-padding around the cuboid in the binary output
+
+    Returns:
+    - binary (np.ndarray): tight binary image of the target label
+    - z0, z1, y0, y1, x0, x1 (int): x, y, and z position of the binary image in the original labelled image
+    """
+
     if not np.any(labelled == label):
         print(f"Label{label} doesn't appear in provided image")
         return None
 
     z, y, x = np.where(labelled == label)
 
+    # padding is necessary for mesh generation, the cuboid can't touch the border of the binary image
     z0, z1 = z.min() - pad_width, z.max() + pad_width + 1
     y0, y1 = y.min() - pad_width, y.max() + pad_width + 1
     x0, x1 = x.min() - pad_width, x.max() + pad_width + 1
@@ -825,6 +1020,21 @@ def cuboid_binary_tight(labelled: np.ndarray, label: int, pad_width: int = 1):
 def generate_single_cuboid(
     labelled: np.ndarray, label: int, vsize: float, smooth_iter: int
 ):
+    """
+    Constructs the surface mesh and metrics for a single cuboid
+
+    Args:
+    - labelled (np.ndarray): input labelled image
+    - label (int): target label
+    - vsize (int): voxel size in um^3 to compute the volume and surface area of the mesh
+    - smooth_iter (int): number of taubin smoothing iterations applied to the mesh
+
+    Returns:
+    - vertices (np.ndarray): coordinates of the vertices of the mesh
+    - faces (np.ndarray): triangular faces of the mesh. Each face is a list of three vertices that form a triangle.
+    - metrics (np.ndarray): metrics computed fot the target label
+    """
+
     binary_tight, *_ = cuboid_binary_tight(labelled, label)
     binary_tight = np.pad(
         binary_tight, pad_width=1, mode="constant", constant_values=0
@@ -832,6 +1042,7 @@ def generate_single_cuboid(
 
     cuboid = Cuboid(label=label, binary=binary_tight, vsize=vsize)
 
+    # if mesh generation failed
     if cuboid.mesh is None:
         return None, None, None
 
@@ -855,13 +1066,26 @@ def generate_multiple_cuboids_simple(
     dir_path: str = None,
     metrics_only: bool = False,
 ):
+    """
+    Constructs the surface mesh and metrics for all labels in an image. Saves the meshes as .stl (optional) and metrics as .parquet and .csv
+    This operation isn't paralellised but could easily be with multiprocessing
+
+    Args:
+    - labelled (np.ndarray): input labelled image
+    - vsize (int): voxel size in um^3 to compute the volume and surface area of the mesh
+    - smooth_iter (int): number of taubin smoothing iterations applied to the mesh
+    - dir_path (str): output path for the saving of meshes and metrics
+    - metrics_only (bool): controls wether meshes are saved or not
+    """
+
     if not os.path.exists(dir_path):
         os.makedirs(dir_path)
 
     n = np.max(labelled)
-    columns = ["volume", "compactness", "convexity", "IoU", "intertia_ratio"]
+    columns = ["volume", "compactness", "convexity", "IoU", "inertia_ratio"]
     df = pd.DataFrame(0.0, index=np.arange(1, n + 1), columns=columns)
 
+    invalid_count = 0
     for label in tqdm(range(1, n + 1), desc="Generating"):
         binary_tight, *_ = cuboid_binary_tight(labelled, label)
         binary_tight = np.pad(
@@ -873,9 +1097,11 @@ def generate_multiple_cuboids_simple(
         )
 
         if cuboid.mesh is None:
+            invalid_count += 1
             df.drop(label, inplace=True)
             continue
         if not cuboid.mesh.is_watertight:
+            invalid_count += 1
             df.drop(label, inplace=True)
             continue
 
@@ -887,12 +1113,29 @@ def generate_multiple_cuboids_simple(
 
         df.loc[label] = cuboid.metrics()
 
+    print(
+        f"Generated {n-invalid_count}/{n} cuboids successfuly\nInvalid cuboids are probably not watertight"
+    )
+
     df.to_csv(dir_path + "/metrics.csv")
     df.to_parquet(dir_path + "/metrics.parquet")
 
 
 class Cuboid:
+    """
+    Cuboid class containing the tools to contruct and modify the surface mesh of a cuboid, as well as compute and store shape metrics.
+    """
+
     def __init__(self, label, dir_path=None, binary=None, vsize=6):
+        """
+        Initializes an instance of Cuboid
+
+        Args:
+        - label (np.ndarray): unique cuboid label
+        - dir_path (str): directory to save or load cuboid data
+        - vsize (int): voxel size in um^3 to compute the volume and surface area of the mesh
+        - binary (np.ndarray): tight binary image of a cuboid to construct a surface mesh from. If None, the cuboid data is assumed to be existent and is loaded from dir_path.
+        """
         self.label = label
         self.voxel_size = vsize * 1e-3
         self.dir_path = dir_path
@@ -913,7 +1156,13 @@ class Cuboid:
                 f"Cuboid{label} couldn't be generated\nBoth the directory path and the labelled image are invalid"
             )
 
-    def generate(self, binary):
+    def generate(self, binary, verbose=False):
+        """
+        Generate a surface mesh from a tight binary image of a cuboid using Lewiner marching cubes. Use standard mesh fixing operation if the resulting mesh is not watertight.
+
+        Args:
+        - binary (np.ndarray): tight binary image
+        """
         if binary.size == 0:
             print(f"Label {self.label} not found in image")
             return
@@ -932,13 +1181,13 @@ class Cuboid:
         trimesh.repair.fix_inversion(self.mesh)
         if not self.mesh.is_watertight:
             trimesh.repair.fill_holes(self.mesh)
-            if not self.mesh.is_watertight:
+            if not self.mesh.is_watertight and verbose:
                 print(f"Mesh for cuboid {self.label} is not watertight")
 
-    def load(self, file_path):
+    def load(self, file_path, verbose=False):
         with open(file_path, "rb") as f:
             self.mesh = trimesh.load_mesh(f, file_type="stl")
-        if not self.mesh.is_watertight:
+        if not self.mesh.is_watertight and verbose:
             print(f"Mesh for cuboid {self.label} is not watertight")
 
     def save(self):
@@ -947,9 +1196,24 @@ class Cuboid:
             self.mesh.export(file_path)
 
     def smooth(self, iterations=5):
-        trimesh.smoothing.filter_taubin(self.mesh, iterations=iterations)
+        """
+        Apply Taubin smoothing to the cuboid mesh.
+
+        Args:
+        - iterations (int): number of smoothing iterations applied to the mesh
+        """
+        # two iterations of trimesh taubin is one skrinkage pass and one restoration pass
+        trimesh.smoothing.filter_taubin(
+            self.mesh, lamb=0.5, nu=0.53, iterations=2 * iterations
+        )  # using standard and stable lambda/nu parameters
 
     def decimate(self, decimation_percent):
+        """
+        Apply quadratic decimation to a surface mesh to simplify its representation
+
+        Args:
+        - decimation_percent (float)
+        """
         self.simplified = self.mesh.simplify_quadric_decimation(
             percent=decimation_percent
         )
@@ -971,6 +1235,9 @@ class Cuboid:
         return compactness
 
     def cube_IoU(self):
+        """
+        Creates a cube of similar volume and alignes the principal inertia vectors of the cuboid mesh with the faces of the cube
+        """
         transform = self.mesh.principal_inertia_transform
         self.aligned_mesh = self.mesh.copy()
         self.aligned_mesh.apply_transform(transform)
@@ -992,7 +1259,7 @@ class Cuboid:
 
     def inertia_ratio(self):
         components = self.mesh.principal_inertia_components
-        ratio = np.max(components) / np.min(components)
+        ratio = np.min(components) / np.max(components)
         return ratio
 
     def metrics(self):
