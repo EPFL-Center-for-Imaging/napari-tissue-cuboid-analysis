@@ -29,6 +29,16 @@ dependencies = [
     "magicgui",
     "qtpy",
     "scikit-image",
+    "scikit-learn",
+    "matplotlib",
+    "pandas",
+    "seaborn",
+    "pyvista",
+    "tifffile",
+    "scipy",
+    "trimesh",
+    "spam",
+    "tqdm",
 ]
 
 [project.optional-dependencies]
