@@ -46,34 +46,100 @@ Reduces the size of the image by applying an isotropic median kernel. This step 
 - **Bin kernel**      Size of the median kernel
 
 ### 2: Pipette extraction
-Extracts a binary mask of the pipette that will be used to discard useless areas in further steps. Can either be computed automatically or manually. Default method is automatic.
-
-**Automatic:** Requires tuning of the parameters of a canny edge detector and the window size parameter. If tuned correctly, the pipette is detected automatically. The automatic detection is rather sensitive to the choice of parameters and takes a few second to compute. Intermediary steps of the algorithm can be displayed to help tune the parameters.
-
-**Manual:** Requires selecting three points laying on the inner surface of the pipette on both the first and last slice. This is done by creating a point layer to napari and using the dedicated tool to add points. The three first points must be on the first slice, and the three last points on the last slice. The parameters are not used for this methods.
+Extracts a binary mask of the pipette that will be used to discard useless areas in further steps. Computed using 6 manually annotated points on the boundary of the pipette. You can do this by creating a point layer to napari and using the dedicated tool to add points. The three first points must be on the first slice, and the three last points on the last slice.
 
 - **Input type:**     Graylevel image
 - **Points**          Points layer for the manual method
-- **Sigma**           Standard deviation of the Gaussian filter used by the Canny filter (auto only)
-- **Low thr.**        Low threshold of the Canny filter (auto only)
-- **High thr.**       High threshold of the Canny filter (auto only)
-- **Win. size**       Size of the 2D window in which the algorithm looks for the center of the pipette (auto only)
-                      The window is centered on the image
-### 3: Thresholding
-GMM based thresholding to separate tissue from the background. The algorithm can either chose a global threshold for the whole image or compute a continuous map of local thresholds. The local method is significantly slower but helps with artifacts in the images. It works by fitting GMMs on a grid of windows to produce a sparse grid of thresholds. The threshold map is then computed by linear interpolation of the sparse grid.
 
-- **Input type:**     Graylevel image
-- **Mask:**           Pipette mask computed in step 2
-- **Spacing:**        Spacing of the GMM windows (local only)
-- **Win. size**       Size of the GMM windows, as a ratio of the spacing (local only)
-                      Window size of 0.5 results in non-overlapping but contiguous windows
-                      Higher values result in overlapping windows
-- **Components**      Number of components of the GMMs (local only)
-                      Start with 2 components
-                      Add up to 3 components if there is variation between the brightness of different object which results in missclassification of tissue
-- **Min. std**        Criteria to discard windows that do not contain tissues in the threshold map (local only)
-                      Increase if empty areas are noisy in the binary result of the thresholding
-- **Processes**
+### 3: Thresholding
+GMM based thresholding to separate tissue from the background. The algorithm can either chose a global threshold for the whole image or compute a continuous map of local thresholds. The local method is significantly slower but helps with small reconstruction artifacts in the images. It works by fitting GMMs on a grid of windows to produce a sparse grid of thresholds. The threshold map is then computed by linear interpolation of the sparse grid.
+
+- **Input type:**    Graylevel image
+- **Mask:**          Pipette mask computed in **2: Pipette extraction**
+- **Spacing:**       Spacing of the GMM windows (local only)
+- **Win. size**:     Size of the GMM windows, as a fraction of the spacing - local thresholding only.\
+                     Window size of 0.5 results in non-overlapping but contiguous windows.\
+                     Higher values result in overlapping windows.\
+                     The window size must be bigger than the largest cuboid to avoid windows only containing tissue.
+- **Min. std**       Criteria to discard windows that do not contain tissues in the threshold map - local thresholding only.\
+                     Expressed as a fraction of the standard deviation of the whole image.\
+                     Increase if empty areas are noisy in the binary result of the thresholding
+- **Plot thresh.**   Wether to plot the threshold map the the centers of the all the valid local windows along with the resulting binary image.\
+                     Useful to finetune parameters.
+
+**Advice:** Always try global thresholding first. It is quicker and more stable. Only use local thresholding if some regional features in the image are not captured by the global threshold and result in noise in the binary image.
+
+### 4: Morphology
+Morphological binary opening and closing with a spherical structuring element on binary images, or on each individual label separately in a labelled image (see **5: Labelling**).
+
+- **Input types:**   Binary or labels
+- **Diameter:**      Diameter of the structuring element. Should be odd for consistency
+- **Single:**        Wether to apply to a single label or to all - label morphology only
+
+**Advice:** Only apply strictly necessary operations on the binary image for the smooth operation of **5: Labelling**. Then refine the quality of the segmentation and fill tissue porosity by applying those operation to the labels individually.
+
+### 5: Labelling
+Object labelling using the watershed algorithm. The results of watershed is usually either under-segmentated or over-segmentated. Over-segmentation is automatically fixed by merging labels based on their surface of contact and their characteristic length.
+
+- **Input type:** Binary
+- **Watershed lvl.:** Threshold to merge shallow basins in the watershed algorithm. Decreasing this parameter increases the number of labels generated before the over-segmentation correction. Should be chosen so that the result of the watershed algorithm does not feature any under-segmentation.
+- **Merge thresh.:** Over-segmentation coefficient necessary to merge two regions. Decreasing results in more merging.
+- **Plot interm.:** Wether to plot the intermediary images of the automatic over-segmentation fix. Iteration zero is the original output of the watershed algorithm. Useful to finetune parameters.
+
+**Advice:** Prefer the *Merge thresh.* param. for refining your results and only change *watershed lvl.* if there is under-segmentation in the result or if you need to drastically reduce the number of labels.
+
+#### Optional manual operations:
+- **Input type:** Labels
+- **Merge:** Merge a set of target labels selected using their integer id
+- **Split:** Split a set of target labels selected using their integer id. The watershed process is re-applied to those specific region. The *watershed lvl.* must be reduced in order to split the target label(s) into more regions.
+
+
+### 6: Mesh and metrics generation
+Saves a mesh for each cuboid at the specified location in `.stl` format, as well as the metrics computed for all the cuboids in both `.parquet` and `.csv` formats. A PyVista viewer is made available to scroll through meshes along with their metrics.
+
+- **Input type:** Labels
+- **Directory:** Path to the output directory to store meshes and metrics. Relative to where napari was lauched from, or absolute.
+- **Voxel size:** Size of the voxels in microns to normalize the volumes. Don't forget that binning modifies the resolution in the image.
+- **Smoothing iterations:** Number of taubin smoothing iterations applied to the meshes. Tread carefully, has a significant impact on compactness and convexity. Other metrics are mostly undisturbed.
+- **Single label:** Wether to only construct the mesh and metrics for a single mesh. If true, the mesh is displayed in napari and the metrics printed in the terminal (no saving).
+
+
+
+## Shape metrics
+- **Convexity**:
+  Ratio between the volume of an explant and the volume of its convex hull.
+
+  $$
+  \frac{V}{V_{\text{convexhull}}}
+  $$
+
+- **Compactness**:
+  Dimensionless and normalized quantity that relates the volume of an object to its surface area. The maximum value corresponds to a perfect sphere. A decreasing value indicates elongation or increased surface irregularity.
+
+  $$
+  \frac{1}{36\pi}\frac{V^2}{A^3}
+  $$
+
+- **Elongation**:
+  Ratio between the smallest and largest eigenvalues of the inertia tensor. These eigenvalues describe how mass is distributed along the principal axes, so the metric reflects the overall elongation of the object. Values close to 1 indicate isotropic shapes, while lower values suggest elongated geometries.
+
+  $$
+  \frac{\lambda_{\text{min}}}{\lambda_{\text{max}}}
+  $$
+
+- **Cube similarity**:
+  Intersection over Union (IoU) between the explant and an ideal cube of equal volume. The cube is oriented such that its faces are aligned with the explant’s principal inertia axes. This metric quantifies how closely the shape of the explant resembles a cube.
+
+  $$
+  \frac{V_{\text{intersect}}}{V_{\text{union}}}
+  $$
+
+
+
+
+
+
+
 
 
 ## Issues
